@@ -1,203 +1,168 @@
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.document_loaders import UnstructuredFileLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings, CacheBackedEmbeddings
-from langchain.vectorstores.faiss import FAISS
-from langchain.storage import LocalFileStore
-from langchain.schema.runnable import RunnablePassthrough, RunnableLambda
-from langchain.callbacks.base import BaseCallbackHandler
-from langchain.memory import ConversationBufferMemory
-import streamlit as st
 import os
+import json
+import streamlit as st
 
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 
-class ChatCallbackHandler(BaseCallbackHandler):
-    def __init__(self):
-        self.message = ""
+function = {
+    "name": "create_quiz",
+    "description": "function that takes a list of questions and answers and returns a quiz",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string"
+                        },
+                        "answers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "answer": {
+                                        "type": "string"
+                                    },
+                                    "is_correct": {
+                                        "type": "boolean"
+                                    }
+                                },
+                                "required": ["answer", "is_correct"]
+                            }
+                        }
+                    },
+                    "required": ["question", "answers"]
+                }
+            }
+        }
+    }
+}
 
-    def on_llm_start(self, *args, **kwargs):
-        self.message = ""  # 매번 초기화
-        self.message_box = st.empty()
-
-    def on_llm_end(self, *args, **kwargs):
-        save_message(self.message, "ai")
-
-    def on_llm_new_token(self, token, *args, **kwargs):
-        self.message += token
-        self.message_box.markdown(self.message)
-
-
-@st.cache_data(show_spinner="Embedding...")
-def embed_file(file):
-    file_content = file.read()
-    file_path = f"./{file.name}"
-    # 파일 확장자에 따라 저장 모드 결정
-    if file.name.endswith(".txt"):
-        with open(file_path, "w", encoding="utf-8") as f:
-            # bytes → str 변환 필요
-            if isinstance(file_content, bytes):
-                file_content = file_content.decode("utf-8")
-            f.write(file_content)
-    else:
-        with open(file_path, "wb") as f:
-            f.write(file_content)
-    cache_dir = LocalFileStore(f"./.cache/embeddings/{file.name}")
-    splitter = CharacterTextSplitter.from_tiktoken_encoder(
-        separator="\n",
-        chunk_size=600,
-        chunk_overlap=100,
+prompt = PromptTemplate.from_template(
+    "Make a quiz about {topic}. The difficulty level should be {difficulty}. Create questions that are appropriate for {difficulty} level."
     )
-    loader = UnstructuredFileLoader(file_path)
-    docs = loader.load_and_split(splitter)
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
-        embeddings,
-        cache_dir
-    )
-    vectorstore = FAISS.from_documents(docs, cached_embeddings)
-    retriever = vectorstore.as_retriever()
-    return retriever
 
-def save_message(message, role):
-    st.session_state.messages.append({"role": role, "message": message})
-
-def send_message(message, role, save=True):
-    with st.chat_message(role):
-        st.markdown(message)
-    if save:
-        save_message(message, role)
-
-def paint_history():
-    for message in st.session_state.messages:
-        send_message(
-            message["message"], 
-            message["role"], 
-            save=False
-        )
-        
-def format_docs(docs):
-    return "\n\n".join([doc.page_content for doc in docs])
-
-st.set_page_config(page_title="DocGPT", page_icon=":book:")
-st.title("DocGPT")
-st.markdown(
-    """
-    Welcome!
-    """
+st.set_page_config(
+    page_title="QuizGPT",
+    page_icon="?",
 )
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+st.title("QuizGPT")
 
-# ConversationBufferMemory 초기화
-if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(memory_key="history", return_messages=True)
+@st.cache_data(show_spinner="Making quiz...")
+def make_quiz(topic, difficulty):
+    chain = prompt | llm
+    return chain.invoke({"topic": topic, "difficulty": difficulty})
 
-memory = st.session_state.memory
-
-# 사이드바에 API Key 입력 및 Github 링크 추가
 with st.sidebar:
     st.markdown("[🔗 Github Repo](https://github.com/hughqlee/fullstack_gpt_challenge)")  # 실제 주소로 변경 필요
     openai_api_key = st.text_input("OpenAI API Key", value=os.environ.get("OPENAI_API_KEY"), type="password")
-    file = st.file_uploader(
-        "Upload a file", 
-        type=["pdf", "docx", "txt"]
-    )
 
-# API Key가 입력되지 않으면 진행 불가 안내
-if not openai_api_key:
-    st.warning("OpenAI API Key를 입력하세요.")
-    st.stop()
+    if not openai_api_key:
+        st.warning("OpenAI API Key를 입력하세요.")
+        st.stop()
 
-if file:
-    retriever = embed_file(file)
-    send_message("I'm ready!", "ai", save=False)
-    paint_history()
-    
-    # ChatCallbackHandler 인스턴스 생성
-    chat_handler = ChatCallbackHandler()
-    
-    # RAG 파이프라인 정의 (retriever가 사용 가능한 시점에서)
-    map_prompt = ChatPromptTemplate.from_messages([
-        ("system", 
-         "You are a helpful assistant. Answer questions using only the following context. If you don't know the answer just say you don't know, don't make it up: {context}"),
-        ("user", "Question:\n{question}"),
-    ])
-    
-    map_llm = ChatOpenAI(
-        temperature=0.1,
-        openai_api_key=openai_api_key,
-    )
-    
-    def map_and_prepare(inputs):
-        question = inputs["question"]
-        docs = retriever.get_relevant_documents(question)
-        snippets = []
-        for doc in docs:
-            out = map_prompt | map_llm
-            resp = out.invoke({"context": doc.page_content, "question": question})
-            text = resp.content.strip()
-            if text:
-                snippets.append(text)
-        combined_context = "\n\n".join(snippets)
-        return {"context": combined_context, "input": question, "history": inputs["history"]}
-    
-    map_reduce_step = RunnablePassthrough.assign(history=lambda _: memory.load_memory_variables({})['history'])
-    map_reduce_step = map_reduce_step | RunnableLambda(map_and_prepare)
-    
-    final_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "당신은 제공된 문서 내용과 대화 기록을 바탕으로 질문에 답하는 도움이 되는 어시스턴트입니다. "
-         "대화 기록을 참고하여 이전 질문들과 연관지어 답변하세요. "
-         "문서에 없는 내용이거나 모르는 것은 '모르겠습니다'라고 답하세요."),
-        ("assistant", "문서 내용:\n{context}"),
-        MessagesPlaceholder(variable_name="history"),
-        ("user", "{input}"),
-    ])
-    
-    final_llm = ChatOpenAI(
+    llm = ChatOpenAI(
         temperature=0.1,
         streaming=True,
-        callbacks=[chat_handler],
-        openai_api_key=openai_api_key,
+        callbacks=[StreamingStdOutCallbackHandler()],
+        openai_api_key=openai_api_key
+    ).bind(
+        function_call={
+            "name": "create_quiz",
+        },
+        functions = [function]
+    )
+
+    topic = st.text_input("Enter a topic for the quiz")
+    difficulty = st.selectbox(
+        "Select difficulty level",
+        ["easy", "medium", "hard"],
+        index=1
     )
     
-    message = st.chat_input("Ask me anything about the file")
-    if message:
-        send_message(message, "user")
-        
-        # 메모리 상태 디버깅
-        current_memory = memory.load_memory_variables({})
-        st.sidebar.write("🧠 Memory Debug:")
-        st.sidebar.write(f"Current history length: {len(current_memory.get('history', []))}")
-        if current_memory.get('history'):
-            st.sidebar.write("Recent messages:")
-            for i, msg in enumerate(current_memory['history'][-3:]):  # 최근 3개만 표시
-                st.sidebar.write(f"{i}: {type(msg)} - {str(msg)[:50]}")
-        
-        chain = map_reduce_step | final_prompt | final_llm
-        with st.chat_message("ai"):
-            response = chain.invoke({"question": message})
-            
-            # 응답 디버깅
-            st.sidebar.write(f"Response type: {type(response)}")
-            st.sidebar.write(f"Response content: {str(response)[:100]}")
-            
-            # 메모리에 대화 저장
-            if hasattr(response, 'content'):
-                response_text = response.content
-            else:
-                response_text = str(response)
+    if st.button("Generate Quiz"):
+        quiz = make_quiz(topic, difficulty)
+        st.session_state.quiz = json.loads(
+            quiz.additional_kwargs["function_call"]["arguments"]
+        )
+        # 퀴즈 생성시 점수 상태 초기화
+        st.session_state.quiz_submitted = False
+        st.session_state.user_answers = {}
+
+if "quiz" in st.session_state:
+    quiz_data = st.session_state.quiz
+    
+    if not st.session_state.get("quiz_submitted", False):
+        with st.form("quiz_form"):
+            user_answers = {}
+            for i, question in enumerate(quiz_data["questions"]):
+                st.write(f"**Question {i+1}:** {question['question']}")
                 
-            memory.save_context(
-                {"input": message},
-                {"output": response_text}
-            )
-            
-            # 저장 후 메모리 상태 확인
-            updated_memory = memory.load_memory_variables({})
-            st.sidebar.write(f"After save - history length: {len(updated_memory.get('history', []))}")
-else:
-    st.session_state.messages = []
+                # 사용자가 이전에 선택한 답안이 있다면 그것을 기본값으로 사용
+                previous_answer = st.session_state.user_answers.get(i, None)
+                try:
+                    default_index = [answer["answer"] for answer in question["answers"]].index(previous_answer) if previous_answer else None
+                except ValueError:
+                    default_index = None
+                
+                value = st.radio(
+                    "Select the correct answer",
+                    [answer["answer"] for answer in question["answers"]],
+                    index=default_index,
+                    key=f"question_{i}"
+                )
+                user_answers[i] = value
+                
+            if st.form_submit_button("Submit Quiz"):
+                st.session_state.user_answers = user_answers
+                st.session_state.quiz_submitted = True
+                st.rerun()
+    
+    else:
+        # 점수 계산 및 결과 표시
+        correct_count = 0
+        total_questions = len(quiz_data["questions"])
         
+        for i, question in enumerate(quiz_data["questions"]):
+            user_answer = st.session_state.user_answers.get(i)
+            st.write(f"**Question {i+1}:** {question['question']}")
+            
+            # 정답 찾기
+            correct_answer = None
+            for answer in question["answers"]:
+                if answer["is_correct"]:
+                    correct_answer = answer["answer"]
+                    break
+            
+            # 사용자 답안 표시
+            if user_answer == correct_answer:
+                st.success(f"✅ Your answer: {user_answer}")
+                correct_count += 1
+            else:
+                st.error(f"❌ Your answer: {user_answer}")
+                st.info(f"💡 Correct answer: {correct_answer}")
+            
+            st.write("---")
+        
+        # 최종 점수 표시
+        score = correct_count / total_questions
+        st.write(f"## 결과: {correct_count}/{total_questions} ({score:.1%})")
+        
+        # 만점인 경우 축하 메시지
+        if score == 1.0:
+            st.success("🎉 완벽합니다! 만점입니다!")
+            st.balloons()
+        else:
+            st.warning(f"조금 더 공부해보세요! 점수: {score:.1%}")
+            
+            # 재시험 버튼
+            if st.button("다시 시험 보기"):
+                st.session_state.quiz_submitted = False
+                st.rerun()
+
